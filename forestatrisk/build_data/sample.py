@@ -19,23 +19,31 @@ import sys  # To read and write files
 import numpy as np  # For arrays
 from osgeo import gdal  # GIS libraries
 import pandas as pd  # To export result as a pandas DF
+import xarray as xr
+import typing as t
 
 # Local imports
-from ..misc import makeblock, progress_bar
+from ..misc import makeblock, progress_bar, makeblock_xr
 
 
 # sample()
-def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
-           var_dir="data",
-           input_forest_raster="forest.tif",
-           output_file="output/sample.txt",
-           blk_rows=0):
+def sample(dset: xr.Dataset,
+           forest_band: str,
+           feature_bands: t.List[str],
+           nsamp=10000,
+           adapt=True,
+           seed=1234,
+           csize=10,
+           blk_rows=0
+) -> pd.DataFrame:
 
     """Sample points and extract raster values.
 
     This function (i) randomly draws spatial points in deforested and
     forested areas and (ii) extract environmental variable values for
     each spatial point.
+
+    :param dset: xarray dataset containing features and deforestation bands
 
     :param nsamp: Number of random spatial points.
 
@@ -46,10 +54,10 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
 
     :param csize: Spatial cell size in km.
 
-    :param var_dir: Directory with raster data.
+    :param feature_bands: bands in dset to use as features
 
-    :param input_forest_raster: Name of the forest raster file
-       (1=forest, 0=deforested) in the var_dir directory.
+    :param forest_bands: Name of the forest raster data varaible
+       (1=forest, 0=deforested)
 
     :param output_file: Path to file to save sample points.
 
@@ -69,12 +77,10 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
     print("Sample 2x {} pixels (deforested vs. forest)".format(nsamp))
 
     # Read defor raster
-    forest_raster_file = os.path.join(var_dir, input_forest_raster)
-    forestR = gdal.Open(forest_raster_file)
-    forestB = forestR.GetRasterBand(1)
+    forestB = dset[forest_band]
 
     # Make blocks
-    blockinfo = makeblock(forest_raster_file, blk_rows=blk_rows)
+    blockinfo = makeblock_xr(dset, blk_rows=blk_rows)
     nblock = blockinfo[0]
     nblock_x = blockinfo[1]
     x = blockinfo[3]
@@ -97,8 +103,9 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
         # Position in 1D-arrays
         px = b % nblock_x
         py = b // nblock_x
-        # Read the data
-        forest = forestB.ReadAsArray(x[px], y[py], nx[px], ny[py])
+        # Read the data into a numpy array
+        forest = forestB.isel(x=slice(x[px], x[px] + nx[px]), y=slice(y[py], y[py] + ny[py]))
+        forest = forest.values
         # Identify pixels (x/y coordinates) which are deforested
         deforpix = np.nonzero(forest == 0)
         ndc_block[b] = len(deforpix[0])  # Number of defor pixels
@@ -110,7 +117,7 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
 
     # Adapt nsamp to forest area
     if adapt is True:
-        gt = forestR.GetGeoTransform()
+        gt = dset.rio.transform()
         pix_area = gt[1] * (-gt[5])
         farea = pix_area * (nfc + ndc) / 10000  # farea in ha
         nsamp_prop = 1000 * farea / 1e6  # 1000 per 1Mha
@@ -155,7 +162,8 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
         px = b % nblock_x
         py = b // nblock_x
         # Read the data
-        forest = forestB.ReadAsArray(x[px], y[py], nx[px], ny[py])
+        forest = forestB.isel(x=slice(x[px], x[px] + nx[px]), y=slice(y[py], y[py] + ny[py]))
+        forest = forest.values
         # Identify pixels (x/y coordinates) which are deforested
         # !! Values returned in row-major, C-style order (y/x) !!
         deforpix = np.nonzero(forest == 0)
@@ -197,9 +205,9 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
     print("Compute center of pixel coordinates")
 
     # Landscape variables from forest raster
-    gt = forestR.GetGeoTransform()
-    ncol_r = forestR.RasterXSize
-    nrow_r = forestR.RasterYSize
+    gt = dset.rio.transform()
+    ncol_r = dset.rio.width
+    nrow_r = dset.rio.height
     Xmin = gt[0]
     Xmax = gt[0] + gt[1] * ncol_r
     Ymin = gt[3] + gt[5] * nrow_r
@@ -235,53 +243,19 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
     # Extract values from rasters
     # =============================================
 
-    # Raster list
-    var_tif = var_dir + "/*.tif"
-    raster_list = glob(var_tif)
-    raster_list.sort()  # Sort names
+    nobs = len(xOffset)
+    feature_dset = dset[feature_bands]
+    # Get values for all the specified coordinates
+    x_coords = xr.DataArray(xOffset, dims='z')
+    y_coords = xr.DataArray(yOffset, dims='z')
 
-    # Make vrt with gdal.BuildVRT
-    # Note: Extent and resolution from forest raster!
-    print("Make virtual raster with variables as raster bands")
-    param = gdal.BuildVRTOptions(resolution="user",
-                                 outputBounds=(Xmin, Ymin, Xmax, Ymax),
-                                 xRes=gt[1], yRes=-gt[5],
-                                 separate=True)
-    gdal.BuildVRT("/vsimem/var.vrt", raster_list, options=param)
-    stack = gdal.Open("/vsimem/var.vrt")
-
-    # List of nodata values
-    nband = stack.RasterCount
-    bandND = np.zeros(nband)
-    for k in range(nband):
-        band = stack.GetRasterBand(k + 1)
-        bandND[k] = band.GetNoDataValue()
-        if bandND[k] is None:
-            print("NoData value is not specified \
-            for input raster file " + raster_list[k])
-            sys.exit(1)
-
-    # Numpy array to store values
-    nobs = select.shape[0]
-    val = np.zeros(shape=(nobs, nband), dtype=float)
-
-    # Extract raster values
-    print("Extract raster values for selected pixels")
-    for i in range(nobs):
-        # Progress bar
-        progress_bar(nobs, i + 1)
-        # ReadArray for extract
-        extract = stack.ReadAsArray(int(xOffset[i]), int(yOffset[i]), 1, 1)
-        val[i, :] = extract.reshape(nband,)
-
-    # Close stack
-    del stack
-
-    # Replace NA
-    # NB: ReadAsArray return float32 type
-    bandND = bandND.astype(np.float32)
-    for k in range(nband):
-        val[val[:, k] == bandND[k], k] = np.nan
+    feature_data = feature_dset.sel(x=x_coords, y=y_coords, method='nearest')
+    # Convert to numpy array
+    val = feature_data.values
+    # Reshape to 2D array
+    val = val.reshape((nobs, len(feature_bands)))
+    # To float
+    val = val.astype(np.float32)
 
     # Add XY coordinates and cell number
     pts_x.shape = (nobs, 1)
@@ -289,25 +263,8 @@ def sample(nsamp=10000, adapt=True, seed=1234, csize=10,
     cell.shape = (nobs, 1)
     val = np.concatenate((val, pts_x, pts_y, cell), axis=1)
 
-    # =============================================
-    # Export and return value
-    # =============================================
-
-    print("Export results to file " + output_file)
-
-    # Write to file by row
-    colname = raster_list
-    for i in range(len(raster_list)):
-        base_name = os.path.basename(raster_list[i])
-        index_dot = base_name.index(".")
-        colname[i] = base_name[:index_dot]
-
-    varname = ",".join(colname) + ",X,Y,cell"
-    np.savetxt(output_file, val, header=varname, fmt="%s",
-               delimiter=",", comments="")
-
     # Convert to pandas DataFrame and return the result
-    colname.extend(["X", "Y", "cell"])
+    colname = feature_bands + ["X", "Y", "cell"]
     val_DF = pd.DataFrame(val, columns=colname)
     return val_DF
 

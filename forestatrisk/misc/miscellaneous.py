@@ -14,6 +14,8 @@ from __future__ import division, print_function  # Python 3 compatibility
 import os
 import sys
 
+import xarray as xr
+import typing as t
 # Third party imports
 import numpy as np
 from osgeo import gdal
@@ -61,7 +63,6 @@ def make_dir(newdir):
         # print "_mkdir %s" % repr(newdir)
         if tail:
             os.mkdir(newdir)
-
 
 # Makeblock
 def makeblock(rasterfile, blk_rows=128):
@@ -114,6 +115,42 @@ def makeblock(rasterfile, blk_rows=128):
     # b = None
     del r
     return (nblock, nblock_x, nblock_y, x, y, nx, ny)
+
+
+def makeblock_xr(d: t.Union[xr.Dataset, xr.DataArray], blk_rows: int = 128):
+    """
+
+    xarray version of makeblock
+    
+    
+    """
+    ncol, nrow = d.sizes['x'], d.sizes['y']
+    # Block size
+    # Adapt number of blocks
+    if blk_rows > 0:
+        block_xsize = ncol
+        block_ysize = blk_rows
+    else:
+        block_xsize = 256
+        block_ysize = 256
+    # Number of blocks
+    nblock_x = int(np.ceil(ncol / block_xsize))
+    nblock_y = int(np.ceil(nrow / block_ysize))
+    nblock = nblock_x * nblock_y
+    # Upper-left coordinates of each block
+    x = np.arange(0, ncol, block_xsize, dtype=int).tolist()
+    y = np.arange(0, nrow, block_ysize, dtype=int).tolist()
+    # Size (number of col and row) of each block
+    nx = [block_xsize] * nblock_x
+    ny = [block_ysize] * nblock_y
+    # Modify last values of nx and ny
+    if (ncol % block_xsize) > 0:
+        nx[-1] = ncol % block_xsize
+    if (nrow % block_ysize) > 0:
+        ny[-1] = nrow % block_ysize
+    # b = None
+    return (nblock, nblock_x, nblock_y, x, y, nx, ny)
+
 
 
 # Make_square
